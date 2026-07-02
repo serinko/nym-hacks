@@ -28,7 +28,9 @@ You can spin it up yourself anywhere, below is the setup.
 
 ## Files
 
-- `generate_network_metrics.py` — the generator; fetches live API, writes HTML
+- `nym_metrics_common.py` - shared scoring/fetch/aggregate logic, imported by both other scripts - put all three in the same directory.
+- `generate_network_metrics.py` - runs every 5 min, writes `index.html` + `country/XX.html` for all (~70) countries
+- `record_snapshot.py` - runs hourly, writes to SQLite, trims >30 days automatically
 
 ---
 
@@ -40,8 +42,11 @@ SSH to your server and do:
 
 ```bash
 sudo mkdir -p /opt/nym-metrics
-sudo cp generate_network_metrics.py /opt/nym-metrics/
+sudo cp nym_metrics_common.py record_snapshot.py generate_network_metrics.py /opt/nym-metrics/
 sudo chmod 755 /opt/nym-metrics/generate_network_metrics.py
+sudo chmod 755 /opt/nym-metrics/record_snapshot.py
+sudo chmod 755 /opt/nym-metrics/nym_metrics_common.py
+sudo mkdir -p /var/lib/nym-metrics
 ```
 
 ### 2. Create the nginx web directory
@@ -55,7 +60,7 @@ sudo mkdir -p /var/www/html/network-load
 In whichever vhost config is serving your main domain, add:
 
 ```nginx
-location /network-load/ {
+location ^~ /network-load/ {
     alias /var/www/html/network-load/;
     index index.html;
 }
@@ -70,8 +75,19 @@ sudo nginx -t && sudo service nginx reload
 ### 4. Run once manually to verify
 
 ```bash
+sudo python3 /opt/nym-metrics/record_snapshot.py
 sudo python3 /opt/nym-metrics/generate_network_metrics.py
-# Should print: Got 456 gateway entries, Written → /var/www/html/network-load/index.html
+
+# should print:
+# [2026-07-02T12:30:37] Recording snapshot ...
+#   Nodes: 468  Locations: 70  Perf: 0.900  Load: 0.092
+#   DB size: 44.0 KB  →  /var/lib/nym-metrics/history.db
+# [2026-07-02T12:30:38.181404+00:00] Fetching https://mainnet-node-status-api.nymtech.cc/dvpn/v1/directory/gateways ...
+#   Got 468 gateway entries
+#   Nodes: 468  Locations: 70  Perf: 90.0%  Load: 9.2%
+#   History: 3 global snapshots loaded
+#   Written → /var/www/html/network-load/index.html
+#   Written → 70 country pages in /var/www/html/network-load/country/
 ```
 
 ### 5. Wire up cron (every 5 minutes)
@@ -84,6 +100,7 @@ Add:
 
 ```
 */5 * * * * /usr/bin/python3 /opt/nym-metrics/generate_network_metrics.py >> /var/log/nym-metrics.log 2>&1
+0 * * * *   /usr/bin/python3 /opt/nym-metrics/record_snapshot.py >> /var/log/nym-metrics-history.log 2>&1
 ```
 
 ---
