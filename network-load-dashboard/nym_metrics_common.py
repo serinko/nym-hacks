@@ -13,7 +13,7 @@ DB_PATH     = "/var/lib/nym-metrics/history.db"
 WEB_ROOT    = "/var/www/html/network-load"
 
 MIXNET_SCORE_MAP = {"high": 1.0, "medium": 0.625, "low": 0.30, "offline": 0.0}
-LOAD_SCORE_MAP   = {"low": 0.0, "medium": 0.5, "high": 1.0}
+LOAD_SCORE_MAP   = {"low": 0.0, "medium": 0.5, "high": 1.0, "offline": 1.0}
 
 HARBOURMASTER_URL = "https://harbourmaster.nymtech.net/gateway/{identity_key}"
 SPECTREDAO_URL    = "https://explorer.nym.spectredao.net/nodes/{identity_key}"
@@ -121,7 +121,7 @@ def aggregate(gateways: list) -> dict:
         countries[cc]["node_count"] += 1
         countries[cc]["nodes"].append({
             "identity_key":  ikey,
-            "name":          name,
+            "name":         name,
             "city":          city,
             "perf_score":    ps,
             "has_probe":     has_probe,
@@ -173,4 +173,4 @@ def aggregate(gateways: list) -> dict:
         "countries":      sorted(country_data, key=lambda c: -(c["mean_perf"] or 0)),
         "perf_alerts":    perf_alerts,
         "load_alerts":    load_alerts,
-    }
+    } 
