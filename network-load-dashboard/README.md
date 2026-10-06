@@ -69,12 +69,12 @@ dig +short metrics.example.com
 SSH to your server and do:
 
 ```bash
-git clone https://github.com/serinko/nym-hacks.git
+git clone -b master https://github.com/serinko/nym-hacks.git
 sudo mkdir -p /opt/nym-metrics /var/lib/nym-metrics /var/www/html/network-load
 sudo cp nym-hacks/network-load-dashboard/{generate_network_metrics.py,interim_api.py,record_snapshot.py} /opt/nym-metrics/
 ```
 
-> Do not paste the scripts through `nvim`/`vim` - auto-indent and auto-pairing silently break Python. Use `git clone`, `scp` or `cat > file << 'EOF'`. Eventually use `nano`.
+> Do not paste the scripts through `nvim`/`vim` - auto-indent and auto-pairing silently break Python. Use `git clone`, `scp` or `cat > file << 'EOF'`.
 
 ### 3. Add nginx vhost
 
@@ -161,7 +161,7 @@ History graphs and the history endpoints fill in hour by hour from the first sna
 Pull and copy the scripts again, nothing else:
 
 ```bash
-cd nym-hacks && git pull
+cd nym-hacks && git pull origin master
 sudo cp network-load-dashboard/{generate_network_metrics.py,interim_api.py,record_snapshot.py} /opt/nym-metrics/
 sudo python3 /opt/nym-metrics/record_snapshot.py
 sudo python3 /opt/nym-metrics/generate_network_metrics.py
@@ -193,14 +193,14 @@ This API is interim and unofficial - it's planned to move into the Node Status A
 `export_nym_network_stats.py` (in the parent directory of this repo) pulls the interim API and prints a markdown table of the key metrics with week-over-week change - ready for team meeting notes. Runs anywhere with Python 3, no clone needed:
 
 ```bash
-curl -s https://raw.githubusercontent.com/serinko/nym-hacks/main/export_nym_network_stats.py | python3 -
+curl -s https://raw.githubusercontent.com/serinko/nym-hacks/master/export_nym_network_stats.py | python3 -
 ```
 
 Save to a file or point to your own deployment:
 
 ```bash
-curl -s https://raw.githubusercontent.com/serinko/nym-hacks/main/export_nym_network_stats.py | python3 - -o nym-network-stats.md
-curl -s https://raw.githubusercontent.com/serinko/nym-hacks/main/export_nym_network_stats.py | python3 - --base-url https://metrics.example.com/api/v0
+curl -s https://raw.githubusercontent.com/serinko/nym-hacks/master/export_nym_network_stats.py | python3 - -o nym-network-stats.md
+curl -s https://raw.githubusercontent.com/serinko/nym-hacks/master/export_nym_network_stats.py | python3 - --base-url https://metrics.example.com/api/v0
 ```
 
 ---
