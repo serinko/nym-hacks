@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """
 Nym Network Metrics - static HTML generator.
-Fetches https://mainnet-node-status-api.nymtech.cc/dvpn/v1/directory/gateways
+Fetches gateway API + bonded nodes + families.
 Writes index.html + country/XX.html pages.
 Cron every 5 min:
     */5 * * * * /usr/bin/python3 /opt/nym-metrics/generate_network_metrics.py >> /var/log/nym-metrics.log 2>&1
@@ -16,25 +16,89 @@ from pathlib import Path
 from collections import defaultdict
 
 # ── Config ────────────────────────────────────────────────────────────────────
-API_URL        = "https://mainnet-node-status-api.nymtech.cc/dvpn/v1/directory/gateways"
+GATEWAYS_API   = "https://mainnet-node-status-api.nymtech.cc/dvpn/v1/directory/gateways"
+SUMMARY_API    = "https://mainnet-node-status-api.nymtech.cc/v2/summary"
+FAMILIES_API   = "https://validator.nymtech.net/api/v1/node-families?size=100&page={page}"
+DESCRIBED_API  = "https://validator.nymtech.net/api/v1/nym-nodes/described?size=100&page={page}"
 OUTPUT_INDEX   = Path("/var/www/html/network-load/index.html")
-OUTPUT_COUNTRY = Path("/var/www/html/network-load/country")
+OUTPUT_COUNTRY     = Path("/var/www/html/network-load/country")
+OUTPUT_RESIDENTIAL = Path("/var/www/html/network-load/residential.html")
 DB_PATH        = Path("/var/lib/nym-metrics/history.db")
 TIMEOUT_SEC    = 30
 
 HARBOURMASTER = "https://harbourmaster.nymtech.net/gateway/{k}"
 SPECTREDAO    = "https://explorer.nym.spectredao.net/nodes/{k}"
 
-# ── Scoring ───────────────────────────────────────────────────────────────────
-# Load: low=good=0.0, high=bad=1.0
 LOAD_SCORE_MAP = {"low": 0.0, "medium": 0.5, "high": 1.0, "offline": 1.0}
 
 
+# ── Fetch ─────────────────────────────────────────────────────────────────────
+def fetch_json(url):
+    req = urllib.request.Request(url, headers={"User-Agent": "nym-metrics/1.0"})
+    with urllib.request.urlopen(req, timeout=TIMEOUT_SEC) as r:
+        return json.loads(r.read().decode())
 
+
+def fetch_gateways():
+    return fetch_json(GATEWAYS_API)
+
+
+def fetch_total_nodes():
+    data = fetch_json(SUMMARY_API)
+    return data["total_nodes"]
+
+
+def fetch_family_stats():
+    all_fam = []
+    page = 0
+    while True:
+        data = fetch_json(FAMILIES_API.format(page=page))
+        all_fam.extend(data["data"])
+        if len(all_fam) >= data["pagination"]["total"]:
+            break
+        page += 1
+
+    active = [f for f in all_fam if len(f.get("members", [])) > 0]
+    node_ids = set()
+    for f in active:
+        for m in f.get("members", []):
+            node_ids.add(m["node_id"])
+
+    # get role breakdown via described endpoint
+    all_desc = []
+    page = 0
+    while True:
+        data = fetch_json(DESCRIBED_API.format(page=page))
+        all_desc.extend(data["data"])
+        if len(all_desc) >= data["pagination"]["total"]:
+            break
+        page += 1
+
+    role_map = {}
+    for n in all_desc:
+        nid  = n["node_id"]
+        desc = n.get("description") or {}
+        role = desc.get("declared_role") or {}
+        role_map[nid] = {
+            "mixnode": role.get("mixnode", False),
+            "gateway": (role.get("entry", False) or
+                        role.get("exit_ipr", False) or
+                        role.get("exit_nr", False)),
+        }
+
+    mix_in_fam = sum(1 for nid in node_ids if role_map.get(nid, {}).get("mixnode"))
+    gw_in_fam  = sum(1 for nid in node_ids if role_map.get(nid, {}).get("gateway"))
+
+    return {
+        "active_families":   len(active),
+        "nodes_in_families": len(node_ids),
+        "mix_in_families":   mix_in_fam,
+        "gw_in_families":    gw_in_fam,
+    }
+
+
+# ── Scoring ───────────────────────────────────────────────────────────────────
 def compute_node_perf(node):
-    # Use the top-level "performance" field which is the authoritative
-    # score already computed by the API (e.g. "0.88"). This correctly
-    # reflects uptime and all probe results as weighted by the API.
     p = node.get("performance")
     if p is None:
         return None, False
@@ -52,7 +116,6 @@ def perf_tier(score):
 
 
 def load_tier_from_score(score):
-    # score 0.0=all low-load, 1.0=all high-load
     if score < 0.25: return "low"
     if score < 0.75: return "medium"
     return "high"
@@ -62,14 +125,7 @@ def mean(lst):
     return sum(lst) / len(lst) if lst else None
 
 
-# ── Fetch ─────────────────────────────────────────────────────────────────────
-def fetch_gateways():
-    req = urllib.request.Request(API_URL, headers={"User-Agent": "nym-metrics/1.0"})
-    with urllib.request.urlopen(req, timeout=TIMEOUT_SEC) as r:
-        return json.loads(r.read().decode())
-
-
-# ── Aggregate ─────────────────────────────────────────────────────────────────
+# ── Aggregate gateways ────────────────────────────────────────────────────────
 def aggregate(gateways):
     total       = len(gateways)
     perf_scores = []
@@ -86,6 +142,8 @@ def aggregate(gateways):
         "nodes":       [],
     })
 
+    residential_nodes = []
+
     for node in gateways:
         pv2  = node.get("performance_v2") or {}
         loc  = node.get("location") or {}
@@ -93,7 +151,6 @@ def aggregate(gateways):
         ikey = node.get("identity_key") or ""
         name = node.get("name") or (ikey[:16] + "...")
 
-        # load - raw API string is "low", "medium", "high", "offline"
         load_str = pv2.get("load") or ""
         load_num = None
         if load_str in LOAD_SCORE_MAP:
@@ -103,7 +160,6 @@ def aggregate(gateways):
             countries[cc]["load_scores"].append(load_num)
             countries[cc]["load_tiers"][load_str] += 1
 
-        # performance
         ps, has_probe = compute_node_perf(node)
         if not has_probe:
             no_probe += 1
@@ -115,7 +171,7 @@ def aggregate(gateways):
             countries[cc]["perf_tiers"][t] += 1
 
         countries[cc]["node_count"] += 1
-        countries[cc]["nodes"].append({
+        node_detail = {
             "identity_key": ikey,
             "name":         name,
             "city":         loc.get("city") or "",
@@ -124,7 +180,11 @@ def aggregate(gateways):
             "perf_tier":    perf_tier(ps) if has_probe else "unknown",
             "load_str":     load_str,
             "uptime":       pv2.get("uptime_percentage_last_24_hours"),
-        })
+        }
+        countries[cc]["nodes"].append(node_detail)
+        if ((loc.get("asn") or {}).get("kind")) == "residential":
+            residential_nodes.append(dict(node_detail, cc=cc,
+                                          asn_name=((loc.get("asn") or {}).get("name") or "")))
 
     country_data = []
     for cc, d in countries.items():
@@ -140,7 +200,10 @@ def aggregate(gateways):
             "load_tier":  load_tier_from_score(cl) if cl is not None else "unknown",
             "perf_tiers": dict(d["perf_tiers"]),
             "load_tiers": dict(d["load_tiers"]),
-            "nodes":      sorted(d["nodes"], key=lambda n: (LOAD_SCORE_MAP.get(n["load_str"], 0), -(n["perf_score"] or 0)), reverse=True),
+            "nodes":      sorted(d["nodes"],
+                                 key=lambda n: (LOAD_SCORE_MAP.get(n["load_str"], 0),
+                                                -(n["perf_score"] or 0)),
+                                 reverse=True),
         })
 
     perf_alerts = sorted(
@@ -151,12 +214,13 @@ def aggregate(gateways):
         [c for c in country_data if c["mean_load"] is not None and c["mean_load"] >= 0.25],
         key=lambda c: -c["mean_load"]
     )
-
     return {
         "total":          total,
         "no_probe":       no_probe,
         "probe_count":    total - no_probe,
         "location_count": len(country_data),
+        # gateways offering at least one QUIC bridge transport (bridges.transports[].transport_type)
+        "quic_bridges":   sum(1 for g in gateways if any(((t.get("transport_type") or "").startswith("quic")) for t in ((g.get("bridges") or {}).get("transports") or []))),
         "mean_perf":      mean(perf_scores),
         "mean_load":      mean(load_scores),
         "perf_tiers":     dict(perf_tiers),
@@ -165,6 +229,15 @@ def aggregate(gateways):
         "countries":      sorted(country_data, key=lambda c: -(c["mean_perf"] or 0)),
         "perf_alerts":    perf_alerts,
         "load_alerts":    load_alerts,
+        "residential":    len(residential_nodes),
+        "residential_locations": len(set(n["cc"] for n in residential_nodes)),
+        # same method as network load: mean of per-node load scores (low=0, medium=0.5, high/offline=1)
+        "residential_load": mean([LOAD_SCORE_MAP[n["load_str"]] for n in residential_nodes
+                                  if n["load_str"] in LOAD_SCORE_MAP]),
+        "residential_nodes": sorted(residential_nodes,
+                                      key=lambda n: (LOAD_SCORE_MAP.get(n["load_str"], 0),
+                                                     -(n["perf_score"] or 0)),
+                                      reverse=True),
     }
 
 
@@ -172,20 +245,29 @@ def aggregate(gateways):
 def load_global_history():
     if not DB_PATH.exists():
         return None
+    optional = ["total_nodes", "active_families", "nodes_in_families",
+                "residential", "residential_locations"]
     with sqlite3.connect(DB_PATH) as conn:
+        cols = {row[1] for row in conn.execute("PRAGMA table_info(global_snapshots)").fetchall()}
+        present = [c for c in optional if c in cols]
         rows = conn.execute(
-            "SELECT ts, node_count, loc_count, mean_perf, mean_load "
-            "FROM global_snapshots ORDER BY ts ASC"
+            "SELECT ts, node_count, loc_count, mean_perf, mean_load"
+            + "".join(", " + c for c in present)
+            + " FROM global_snapshots ORDER BY ts ASC"
         ).fetchall()
     if not rows:
         return None
-    return {
+
+    result = {
         "labels":    [r[0][:16].replace("T", " ") for r in rows],
-        "nodes":     [r[1] for r in rows],
+        "gateways":  [r[1] for r in rows],
         "locations": [r[2] for r in rows],
         "perf":      [round(r[3] * 100, 1) if r[3] is not None else None for r in rows],
         "load":      [round(r[4] * 100, 1) if r[4] is not None else None for r in rows],
     }
+    for i, c in enumerate(present):
+        result[c] = [r[5 + i] for r in rows]
+    return result
 
 
 def load_country_history(cc):
@@ -210,7 +292,7 @@ def load_country_history(cc):
 # ── HTML helpers ──────────────────────────────────────────────────────────────
 def pct(v):
     if v is None: return "&#8212;"
-    return f"{v * 100:.1f}%"
+    return str(round(v * 100, 1)) + "%"
 
 
 def flag(cc):
@@ -221,7 +303,6 @@ def flag(cc):
 
 
 def gauge_color(v, invert=False):
-    # invert=True for load: high load score = red
     if invert:
         if v < 0.25: return "#00d26a"
         if v < 0.75: return "#f5a623"
@@ -233,25 +314,23 @@ def gauge_color(v, invert=False):
 
 
 def perf_badge(tier):
-    # high perf = green, low perf = red
     c = {
-        "high":    ("background:#0a2a1a;color:#00d26a;border:1px solid #00d26a44"),
-        "medium":  ("background:#2a1e00;color:#f5a623;border:1px solid #f5a62344"),
-        "low":     ("background:#2a1200;color:#e05b2b;border:1px solid #e05b2b44"),
-        "offline": ("background:#1e1e1e;color:#666;border:1px solid #44444444"),
-        "unknown": ("background:#1a1a1a;color:#555;border:1px solid #33333344"),
+        "high":    "background:#0a2a1a;color:#00d26a;border:1px solid #00d26a44",
+        "medium":  "background:#2a1e00;color:#f5a623;border:1px solid #f5a62344",
+        "low":     "background:#2a1200;color:#e05b2b;border:1px solid #e05b2b44",
+        "offline": "background:#1e1e1e;color:#666;border:1px solid #44444444",
+        "unknown": "background:#1a1a1a;color:#555;border:1px solid #33333344",
     }.get(tier, "background:#1a1a1a;color:#555")
     return '<span class="badge" style="' + c + '">' + tier + '</span>'
 
 
 def load_badge(load_str):
-    # low load = green (healthy), high load = red (stressed)
     c = {
-        "low":     ("background:#0a2a1a;color:#00d26a;border:1px solid #00d26a44"),
-        "medium":  ("background:#2a1e00;color:#f5a623;border:1px solid #f5a62344"),
-        "high":    ("background:#2a1200;color:#e05b2b;border:1px solid #e05b2b44"),
-        "offline": ("background:#1e1e1e;color:#666;border:1px solid #44444444"),
-        "unknown": ("background:#1a1a1a;color:#555;border:1px solid #33333344"),
+        "low":     "background:#0a2a1a;color:#00d26a;border:1px solid #00d26a44",
+        "medium":  "background:#2a1e00;color:#f5a623;border:1px solid #f5a62344",
+        "high":    "background:#2a1200;color:#e05b2b;border:1px solid #e05b2b44",
+        "offline": "background:#1e1e1e;color:#666;border:1px solid #44444444",
+        "unknown": "background:#1a1a1a;color:#555;border:1px solid #33333344",
     }.get(load_str, "background:#1a1a1a;color:#555")
     return '<span class="badge" style="' + c + '">' + (load_str or "?") + '</span>'
 
@@ -265,62 +344,79 @@ def build_histogram(perf_scores):
     bars = ""
     for i, b in enumerate(buckets):
         h = max(4, int(b / bmax * 80))
-        bars += '<div class="histo-bar" title="' + str(i*10) + '-' + str(i*10+10) + '%: ' + str(b) + ' nodes" style="height:' + str(h) + 'px"></div>'
+        bars += ('<div class="histo-bar" title="' + str(i*10) + '-' + str(i*10+10) +
+                 '%: ' + str(b) + ' nodes" style="height:' + str(h) + 'px"></div>')
     return bars
+
+
+def _ds(label, data, color, axis, dash=None):
+    return (
+        "{label:'" + label + "',data:" + json.dumps(data) + ","
+        "borderColor:'" + color + "',backgroundColor:'" + color + "22',"
+        "yAxisID:'" + axis + "',tension:0.3,borderWidth:1.5,"
+        "pointRadius:0,pointHoverRadius:3,spanGaps:false,fill:false"
+        + (",borderDash:" + json.dumps(dash) if dash else "") +
+        "}"
+    )
 
 
 def history_chart(hist, chart_id, show_locations=True):
     if hist is None:
         return '<div class="chart-empty">No historical data yet. Accumulates after first hourly snapshot.</div>'
 
-    labels_j = json.dumps(hist["labels"])
-    nodes_j  = json.dumps(hist["nodes"])
-    perf_j   = json.dumps(hist["perf"])
-    load_j   = json.dumps(hist["load"])
-
-    ds = (
-        "{"
-        "label:'Performance %',"
-        "data:" + perf_j + ","
-        "borderColor:'#00d26a',backgroundColor:'#00d26a22',"
-        "yAxisID:'yPct',tension:0.3,pointRadius:2,fill:false"
-        "},{"
-        "label:'Load %',"
-        "data:" + load_j + ","
-        "borderColor:'#e05b2b',backgroundColor:'#e05b2b22',"
-        "yAxisID:'yPct',tension:0.3,pointRadius:2,fill:false"
-        "},{"
-        "label:'Nodes',"
-        "data:" + nodes_j + ","
-        "borderColor:'#f5a623',backgroundColor:'#f5a62322',"
-        "yAxisID:'yCount',tension:0.3,pointRadius:2,fill:false"
-        "}"
-    )
+    ds = [
+        _ds("Performance %", hist["perf"], "#00d26a", "yPct"),
+        _ds("Load %",        hist["load"], "#e05b2b", "yPct"),
+        _ds("Gateways",      hist.get("gateways") or hist.get("nodes", []), "#f5a623", "yCount"),
+    ]
     if show_locations:
-        loc_j = json.dumps(hist.get("locations", []))
-        ds += (",{"
-               "label:'Locations',"
-               "data:" + loc_j + ","
-               "borderColor:'#7b61ff',backgroundColor:'#7b61ff22',"
-               "yAxisID:'yCount',tension:0.3,pointRadius:2,fill:false"
-               "}")
+        ds += [
+            _ds("Locations",             hist.get("locations", []),             "#a855f7", "yCount"),
+            _ds("Total Nodes",           hist.get("total_nodes", []),           "#0ea5e9", "yCount"),
+            _ds("Active Families",       hist.get("active_families", []),       "#f43f5e", "yCount"),
+            _ds("Nodes in Families",     hist.get("nodes_in_families", []),     "#84cc16", "yCount"),
+            _ds("Residential IPs",       hist.get("residential", []),           "#94a3b8", "yCount"),
+            _ds("Residential Locations", hist.get("residential_locations", []), "#14b8a6", "yCount", [5, 3]),
+        ]
+
+    cid = chart_id
+    buttons = (
+        '<div class="zoom-bar">'
+        '<button class="zbtn" data-c="' + cid + '" data-h="24">24h</button>'
+        '<button class="zbtn" data-c="' + cid + '" data-h="168">7d</button>'
+        '<button class="zbtn zon" data-c="' + cid + '" data-h="0">30d</button>'
+        '<span class="zhint">drag to zoom &#183; shift+drag to pan &#183; ctrl+wheel to zoom</span>'
+        '</div>'
+    )
 
     return (
-        '<canvas id="' + chart_id + '" height="120"></canvas>'
+        buttons
+        + '<canvas id="' + cid + '" height="140"></canvas>'
         '<script>(function(){'
-        'var ctx=document.getElementById("' + chart_id + '");'
+        'if(window.ChartZoom){try{Chart.register(window.ChartZoom);}catch(e){}}'
+        'var ctx=document.getElementById("' + cid + '");'
         'var dk=document.documentElement.getAttribute("data-theme")!=="light";'
         'var gc=dk?"#2e343244":"#d4dbd844";'
         'var lc=dk?"#8a9693":"#5a6662";'
-        'new Chart(ctx,{'
+        'var labels=' + json.dumps(hist["labels"]) + ';'
+        'var ch=new Chart(ctx,{'
         'type:"line",'
-        'data:{labels:' + labels_j + ',datasets:[' + ds + ']},'
+        'data:{labels:labels,datasets:[' + ",".join(ds) + ']},'
         'options:{'
         'responsive:true,'
         'interaction:{mode:"index",intersect:false},'
         'plugins:{'
         'legend:{labels:{color:lc,boxWidth:12,font:{size:11}}},'
-        'tooltip:{backgroundColor:dk?"#1c201f":"#fff",borderColor:dk?"#2e3432":"#d4dbd8",borderWidth:1,titleColor:dk?"#e8edeb":"#111413",bodyColor:lc}'
+        'tooltip:{backgroundColor:dk?"#1c201f":"#fff",borderColor:dk?"#2e3432":"#d4dbd8",borderWidth:1,titleColor:dk?"#e8edeb":"#111413",bodyColor:lc},'
+        'zoom:{'
+        'limits:{x:{minRange:3}},'
+        'pan:{enabled:true,mode:"x",modifierKey:"shift"},'
+        'zoom:{mode:"x",'
+        'wheel:{enabled:true,modifierKey:"ctrl"},'
+        'pinch:{enabled:true},'
+        'drag:{enabled:true,backgroundColor:"rgba(0,210,106,0.12)",borderColor:"#00d26a",borderWidth:1}},'
+        'onZoomComplete:function(){setActive(null);}'
+        '}'
         '},'
         'scales:{'
         'x:{ticks:{color:lc,maxTicksLimit:10,font:{size:10},maxRotation:30},grid:{color:gc}},'
@@ -329,6 +425,17 @@ def history_chart(hist, chart_id, show_locations=True):
         '}'
         '}'
         '});'
+        'var btns=document.querySelectorAll(\'.zbtn[data-c="' + cid + '"]\');'
+        'function setActive(b){btns.forEach(function(x){x.classList.toggle("zon",x===b);});}'
+        'function lastTs(){return new Date(labels[labels.length-1].replace(" ","T")+":00Z").getTime();}'
+        'btns.forEach(function(b){b.addEventListener("click",function(){'
+        'var h=parseInt(b.dataset.h,10);'
+        'if(!h||!ch.zoomScale){if(ch.resetZoom)ch.resetZoom();setActive(b);return;}'
+        'var cut=lastTs()-h*3600000,i=0;'
+        'while(i<labels.length-1&&new Date(labels[i].replace(" ","T")+":00Z").getTime()<cut)i++;'
+        'ch.zoomScale("x",{min:i,max:labels.length-1},"default");setActive(b);'
+        '});});'
+        'ctx.addEventListener("dblclick",function(){if(ch.resetZoom)ch.resetZoom();setActive(btns[btns.length-1]);});'
         '})();</script>'
     )
 
@@ -348,18 +455,18 @@ a{color:var(--accent);text-decoration:none}a:hover{text-decoration:underline}
 .updated{font-size:12px;color:var(--muted);font-family:var(--mono)}
 .theme-btn{background:var(--bg3);border:1px solid var(--border);color:var(--text);cursor:pointer;padding:5px 10px;border-radius:var(--r);font-size:13px}
 .theme-btn:hover{background:var(--border)}
-.summary{background:var(--bg2);border-bottom:1px solid var(--border);padding:10px 32px;display:flex;align-items:center;gap:32px;flex-wrap:wrap}
+.summary{background:var(--bg2);border-bottom:1px solid var(--border);padding:10px 32px;display:flex;align-items:center;gap:16px;flex-wrap:wrap}
 .s-stat{display:flex;align-items:baseline;gap:8px}
-.s-val{font-family:var(--mono);font-size:22px;font-weight:700;color:var(--accent)}
-.s-lbl{font-size:12px;color:var(--muted);text-transform:uppercase;letter-spacing:.05em}
-.s-div{width:1px;height:24px;background:var(--border)}
+.s-val{font-family:var(--mono);font-size:20px;font-weight:700;color:var(--accent)}
+.s-lbl{font-size:11px;color:var(--muted);text-transform:uppercase;letter-spacing:.05em}
+.s-div{width:1px;height:24px;background:var(--border);flex-shrink:0}
 .main{max-width:1200px;margin:0 auto;padding:32px 24px;display:flex;flex-direction:column;gap:32px}
 .section{background:var(--bg2);border:1px solid var(--border);border-radius:var(--r);overflow:hidden}
 .sec-hdr{padding:16px 24px;border-bottom:1px solid var(--border);display:flex;align-items:center;gap:10px}
 .sec-hdr h2{font-size:14px;font-weight:600;letter-spacing:.03em;text-transform:uppercase;color:var(--muted)}
-.sec-num{font-family:var(--mono);font-size:11px;color:var(--accent);background:var(--bg3);border:1px solid var(--border);padding:2px 6px;border-radius:3px}
 .sec-body{padding:24px}
 .pair{display:grid;grid-template-columns:1fr 1fr;gap:24px}
+.pair.top{align-items:start}
 @media(max-width:800px){.pair{grid-template-columns:1fr}.header,.summary{padding:12px 16px}.main{padding:16px}}
 .big{display:flex;align-items:flex-end;gap:16px;margin-bottom:20px}
 .bignum{font-family:var(--mono);font-size:52px;font-weight:700;line-height:1}
@@ -411,6 +518,15 @@ td a{color:inherit}td a:hover{color:var(--accent)}
 .nlink{font-size:10px;font-family:var(--mono);padding:2px 7px;border-radius:3px;background:var(--bg3);border:1px solid var(--border);color:var(--accent)}
 .nlink:hover{background:var(--border)}
 .ikey{font-family:var(--mono);font-size:11px;color:var(--muted)}
+.zoom-bar{display:flex;align-items:center;gap:6px;margin-bottom:10px;flex-wrap:wrap}
+.zbtn{background:var(--bg3);border:1px solid var(--border);color:var(--muted);font-family:var(--mono);font-size:11px;padding:3px 10px;border-radius:var(--r);cursor:pointer}
+.zbtn:hover{color:var(--text)}
+.zbtn.zon{color:var(--accent);border-color:var(--accent)}
+.zhint{font-size:10px;color:var(--muted);font-family:var(--mono);margin-left:8px}
+table.sortable th[data-t]{cursor:pointer;user-select:none;white-space:nowrap}
+table.sortable th[data-t]:hover{color:var(--text)}
+table.sortable th.sasc::after{content:" \\25B2";color:var(--accent)}
+table.sortable th.sdesc::after{content:" \\25BC";color:var(--accent)}
 .footer{text-align:center;color:var(--muted);font-size:11px;font-family:var(--mono);padding:24px;border-top:1px solid var(--border)}
 """
 
@@ -431,8 +547,11 @@ THEME_JS = (
     '}})();'
 )
 
-
-CHARTJS = '<script src="https://cdnjs.cloudflare.com/ajax/libs/Chart.js/4.4.1/chart.umd.min.js"></script>'
+CHARTJS = (
+    '<script src="https://cdnjs.cloudflare.com/ajax/libs/Chart.js/4.4.1/chart.umd.min.js"></script>'
+    '<script src="https://cdnjs.cloudflare.com/ajax/libs/hammer.js/2.0.8/hammer.min.js"></script>'
+    '<script src="https://cdnjs.cloudflare.com/ajax/libs/chartjs-plugin-zoom/2.0.1/chartjs-plugin-zoom.min.js"></script>'
+)
 
 
 def page_open(title):
@@ -448,7 +567,7 @@ def page_open(title):
 
 
 def page_close():
-    return '<script>' + THEME_JS + '</script></body></html>'
+    return '<script>' + THEME_JS + SORT_JS + '</script></body></html>'
 
 
 def render_header(title, generated, back=None):
@@ -482,43 +601,42 @@ def render_summary(stats):
     return '<div class="summary">' + '<div class="s-div"></div>'.join(parts) + '</div>'
 
 
-def country_rows(countries, sort_key):
-    is_perf = sort_key == "mean_perf"
+def locations_rows(countries):
+    """One row per country: performance + load side by side, sortable client-side."""
     rows = ""
-    for c in sorted(countries, key=lambda x: -(x[sort_key] or 0)):
-        val   = c["mean_perf"] if is_perf else c["mean_load"]
-        ls    = ('<span class="ls">low sample</span>' if c["low_sample"] else "")
-        link  = '<a href="country/' + c["cc"] + '.html">' + flag(c["cc"]) + ' <strong>' + c["cc"] + '</strong></a>' + ls
-
-        if is_perf:
-            badge = perf_badge(c["perf_tier"])
-            # perf distribution: high=green, low=red
-            pill_colors = {"high": "#0a2a1a;color:#00d26a", "medium": "#2a1e00;color:#f5a623", "low": "#2a1200;color:#e05b2b", "offline": "#1e1e1e;color:#666"}
-            order = ["high", "medium", "low", "offline"]
-            src   = c["perf_tiers"]
-        else:
-            badge = load_badge(c["load_tier"])
-            # load distribution: low=green (good), high=red (bad)
-            pill_colors = {"low": "#0a2a1a;color:#00d26a", "medium": "#2a1e00;color:#f5a623", "high": "#2a1200;color:#e05b2b", "offline": "#1e1e1e;color:#666"}
-            order = ["low", "medium", "high", "offline"]
-            src   = c["load_tiers"]
-
-        pills = ""
-        for k in order:
-            v = src.get(k, 0)
-            if v > 0:
-                pills += '<span class="tp" style="background:' + pill_colors.get(k, "#1e1e1e;color:#666") + '">' + k[0].upper() + ':' + str(v) + '</span>'
-
+    for c in sorted(countries, key=lambda x: -(x["mean_perf"] or 0)):
+        ls   = ('<span class="ls">low sample</span>' if c["low_sample"] else "")
+        link = '<a href="country/' + c["cc"] + '.html">' + flag(c["cc"]) + ' <strong>' + c["cc"] + '</strong></a>' + ls
+        pv   = c["mean_perf"] if c["mean_perf"] is not None else -1
+        lv   = c["mean_load"] if c["mean_load"] is not None else -1
         rows += (
             '<tr>'
-            '<td>' + link + '</td>'
-            '<td>' + str(c["node_count"]) + '</td>'
-            '<td>' + pct(val) + '</td>'
-            '<td>' + badge + '</td>'
-            '<td class="tpills">' + pills + '</td>'
+            '<td data-v="' + c["cc"] + '">' + link + '</td>'
+            '<td data-v="' + str(c["node_count"]) + '">' + str(c["node_count"]) + '</td>'
+            '<td data-v="' + str(pv) + '">' + pct(c["mean_perf"]) + ' ' + perf_badge(c["perf_tier"]) + '</td>'
+            '<td data-v="' + str(lv) + '">' + pct(c["mean_load"]) + ' ' + load_badge(c["load_tier"]) + '</td>'
             '</tr>'
         )
     return rows
+
+
+SORT_JS = (
+    'document.querySelectorAll("table.sortable").forEach(function(t){'
+    'var ths=t.querySelectorAll("th[data-t]");'
+    'ths.forEach(function(th,ci){th.addEventListener("click",function(){'
+    'var idx=Array.prototype.indexOf.call(th.parentNode.children,th);'
+    'var asc=th.classList.contains("sdesc");'
+    'ths.forEach(function(x){x.classList.remove("sasc","sdesc");});'
+    'th.classList.add(asc?"sasc":"sdesc");'
+    'var tb=t.tBodies[0],rs=Array.prototype.slice.call(tb.rows);'
+    'var num=th.dataset.t==="n";'
+    'rs.sort(function(a,b){'
+    'var x=a.cells[idx].dataset.v,y=b.cells[idx].dataset.v;'
+    'var r=num?(parseFloat(x)-parseFloat(y)):x.localeCompare(y);'
+    'return asc?r:-r;});'
+    'rs.forEach(function(r){tb.appendChild(r);});'
+    '});});});'
+)
 
 
 def alert_rows(alerts, kind, from_country=False):
@@ -554,7 +672,7 @@ def atomic_write(path, content):
 
 
 # ── Index page ────────────────────────────────────────────────────────────────
-def render_index(data, hist, generated):
+def render_index(data, fam, total_nodes, hist, generated):
     mp = data["mean_perf"] or 0
     ml = data["mean_load"] or 0
     pt = data["perf_tiers"]
@@ -564,42 +682,54 @@ def render_index(data, hist, generated):
     pc = gauge_color(mp, invert=False)
     lc = gauge_color(ml, invert=True)
 
-    lw = str(round(lt.get("low",  0) / lt_total * 100, 1))
+    lw = str(round(lt.get("low",    0) / lt_total * 100, 1))
     mw = str(round(lt.get("medium", 0) / lt_total * 100, 1))
-    hw = str(round(lt.get("high", 0) / lt_total * 100, 1))
+    hw = str(round(lt.get("high",   0) / lt_total * 100, 1))
 
     histo = build_histogram(data["perf_scores"])
     chart = history_chart(hist, "globalChart", show_locations=True)
-    pr    = country_rows(data["countries"], "mean_perf")
-    lr    = country_rows(data["countries"], "mean_load")
+    locs  = locations_rows(data["countries"])
     pa    = alert_rows(data["perf_alerts"], "perf")
     la    = alert_rows(data["load_alerts"], "load")
+
+    tn_str  = str(total_nodes) if total_nodes is not None else "?"
+    af_str  = str(fam["active_families"])
+    nf_str  = str(fam["nodes_in_families"])
+    gf_str  = str(fam["gw_in_families"])
+    mf_str  = str(fam["mix_in_families"])
 
     return (
         page_open("Nym Network Metrics")
         + render_header("Network Metrics", generated)
         + render_summary([
-            (data["total"],          "Total Nodes"),
+            (data["total"],          "Gateways Total"),
+            (tn_str,                 "Nodes Total"),
             (data["location_count"], "Locations"),
-            (data["probe_count"],    "Nodes Measured"),
-            (data["no_probe"],       "No Probe Data"),
+            (data["quic_bridges"],   "QUIC Bridges"),
+            (af_str,                 "Active Families"),
+            (nf_str,                 "Nodes in Families"),
+            (gf_str,                 "Gateways in Families"),
+            (mf_str,                 "Mixnodes in Families"),
+            ('<a href="residential.html" style="color:var(--accent);text-decoration:none">' + str(data["residential"]) + '</a>', "Residential IPs"),
+            ('<a href="residential.html" style="color:var(--accent);text-decoration:none">' + str(data["residential_locations"]) + '</a>', "Residential Locations"),
+            ('<a href="residential.html" style="text-decoration:none;color:'
+             + gauge_color(data["residential_load"] or 0, invert=True) + '">'
+             + pct(data["residential_load"]) + '</a>', "Residential Load"),
         ])
         + '<main class="main">'
 
-        # history
         + '<div class="section">'
-        + '<div class="sec-hdr"><span class="sec-num">00</span><h2>30-Day History</h2></div>'
+        + '<div class="sec-hdr"><h2>30-Day History</h2></div>'
         + '<div class="chart-wrap">' + chart + '</div>'
         + '</div>'
 
-        # perf + load
         + '<div class="pair">'
 
         + '<div class="section">'
-        + '<div class="sec-hdr"><span class="sec-num">01</span><h2>Network Performance</h2></div>'
+        + '<div class="sec-hdr"><h2>Network Performance</h2></div>'
         + '<div class="sec-body">'
         + '<div class="big"><div class="bignum" style="color:' + pc + '">' + pct(mp) + '</div>'
-        + '<div class="meta"><strong>Mean performance score</strong>Across ' + str(data["probe_count"]) + ' measurable nodes<br>Formula: mixnet &#215; (download_speed &#215; ping_v4)</div></div>'
+        + '<div class="meta"><strong>Mean performance score</strong>Across ' + str(data["probe_count"]) + ' measurable gateways<br>Source: API performance field (uptime-based)</div></div>'
         + '<div class="pills">'
         + '<span class="pill p-ph">&#9650; High: ' + str(pt.get("high", 0)) + '</span>'
         + '<span class="pill p-pm">&#9670; Medium: ' + str(pt.get("medium", 0)) + '</span>'
@@ -612,7 +742,7 @@ def render_index(data, hist, generated):
         + '</div></div>'
 
         + '<div class="section">'
-        + '<div class="sec-hdr"><span class="sec-num">02</span><h2>Network Load</h2></div>'
+        + '<div class="sec-hdr"><h2>Network Load</h2></div>'
         + '<div class="sec-body">'
         + '<div class="big"><div class="bignum" style="color:' + lc + '">' + pct(ml) + '</div>'
         + '<div class="meta"><strong>Mean load score</strong>0% = all nodes low load (healthy)<br>100% = all nodes high load (stressed)</div></div>'
@@ -636,32 +766,34 @@ def render_index(data, hist, generated):
         + '</div></div>'
         + '</div>'
 
-        # location tables
-        + '<div class="pair">'
-        + '<div class="section"><div class="sec-hdr"><span class="sec-num">03</span><h2>Locations &#8212; Performance</h2></div>'
-        + '<div class="sec-body" style="padding:0"><div class="tbl-wrap"><table>'
-        + '<thead><tr><th>Country</th><th>Nodes</th><th>Score</th><th>Tier</th><th>Distribution</th></tr></thead>'
-        + '<tbody>' + pr + '</tbody></table></div></div></div>'
-        + '<div class="section"><div class="sec-hdr"><span class="sec-num">04</span><h2>Locations &#8212; Load</h2></div>'
-        + '<div class="sec-body" style="padding:0"><div class="tbl-wrap"><table>'
-        + '<thead><tr><th>Country</th><th>Nodes</th><th>Load</th><th>Tier</th><th>Distribution</th></tr></thead>'
-        + '<tbody>' + lr + '</tbody></table></div></div></div>'
+        + '<div class="pair top">'
+        + '<div class="section"><div class="sec-hdr"><h2>Locations</h2>'
+        + '<span class="zhint" style="margin-left:auto">click a column header to sort</span></div>'
+        + '<div class="sec-body" style="padding:0"><div class="tbl-wrap"><table class="sortable">'
+        + '<thead><tr>'
+        + '<th data-t="s">Country</th>'
+        + '<th data-t="n">Nodes</th>'
+        + '<th data-t="n" class="sdesc">Performance</th>'
+        + '<th data-t="n">Load</th>'
+        + '</tr></thead>'
+        + '<tbody>' + locs + '</tbody></table></div></div></div>'
+        + render_residential_inline(data["residential_nodes"])
         + '</div>'
 
-        # alerts
         + '<div class="pair">'
-        + '<div class="section"><div class="sec-hdr"><span class="sec-num">05</span><h2>Performance Alerts</h2></div>'
+        + '<div class="section"><div class="sec-hdr"><h2>Performance Alerts</h2></div>'
         + '<div class="sec-body" style="padding:0"><div class="tbl-wrap"><table>'
         + '<thead><tr><th>Country</th><th>Nodes</th><th>Score</th><th>Status</th></tr></thead>'
         + '<tbody>' + pa + '</tbody></table></div></div></div>'
-        + '<div class="section"><div class="sec-hdr"><span class="sec-num">06</span><h2>Load Alerts</h2></div>'
+        + '<div class="section"><div class="sec-hdr"><h2>Load Alerts</h2></div>'
         + '<div class="sec-body" style="padding:0"><div class="tbl-wrap"><table>'
         + '<thead><tr><th>Country</th><th>Nodes</th><th>Load</th><th>Status</th></tr></thead>'
         + '<tbody>' + la + '</tbody></table></div></div></div>'
         + '</div>'
 
         + '</main>'
-        + '<footer class="footer">Source: ' + API_URL + ' &nbsp;&#183;&nbsp; HTML every 5 min &#183; History hourly</footer>'
+        + '<footer class="footer">Source: ' + GATEWAYS_API + ' &nbsp;&#183;&nbsp; HTML every 5 min &#183; History hourly'
+        + ' &nbsp;&#183;&nbsp; <a href="/swagger/">API (interim)</a></footer>'
         + page_close()
     )
 
@@ -684,7 +816,6 @@ def render_country(country, hist, generated):
     chart = history_chart(hist, "ccChart", show_locations=False)
     ls    = ('<span class="ls">low sample</span>' if country["low_sample"] else "")
 
-    # perf pills
     perf_pills = ""
     for k, sym in [("high", "&#9650;"), ("medium", "&#9670;"), ("low", "&#9660;"), ("offline", "&#10005;")]:
         v = pt.get(k, 0)
@@ -692,7 +823,6 @@ def render_country(country, hist, generated):
             cls = {"high": "p-ph", "medium": "p-pm", "low": "p-pl", "offline": "p-po"}.get(k, "p-pn")
             perf_pills += '<span class="pill ' + cls + '">' + sym + ' ' + k.title() + ': ' + str(v) + '</span>'
 
-    # node rows
     node_rows = ""
     for n in country["nodes"]:
         ikey  = n["identity_key"]
@@ -723,30 +853,28 @@ def render_country(country, hist, generated):
         page_open("Nym &#8212; " + cc + " Network Metrics")
         + render_header(flag(cc) + " " + cc + " &#8212; Gateway Metrics", generated, back="../index.html")
         + render_summary([
-            (str(country["node_count"]) + ("" if not country["low_sample"] else ""), "Nodes"),
+            (str(country["node_count"]), "Gateways"),
             (pct(cp), "Mean Performance"),
             (pct(cl), "Mean Load"),
         ])
         + '<main class="main">'
 
-        # history
         + '<div class="section">'
-        + '<div class="sec-hdr"><span class="sec-num">00</span><h2>30-Day History &#8212; ' + cc + '</h2></div>'
+        + '<div class="sec-hdr"><h2>30-Day History &#8212; ' + cc + '</h2></div>'
         + '<div class="chart-wrap">' + chart + '</div>'
         + '</div>'
 
-        # perf + load
         + '<div class="pair">'
 
-        + '<div class="section"><div class="sec-hdr"><span class="sec-num">01</span><h2>Performance</h2></div>'
+        + '<div class="section"><div class="sec-hdr"><h2>Performance</h2></div>'
         + '<div class="sec-body">'
         + '<div class="big"><div class="bignum" style="color:' + pc + '">' + pct(cp) + '</div>'
-        + '<div class="meta"><strong>Mean across ' + str(measurable) + ' measurable nodes</strong>'
+        + '<div class="meta"><strong>Mean across ' + str(measurable) + ' measurable gateways</strong>'
         + str(country["node_count"] - measurable) + ' without probe data</div></div>'
         + '<div class="pills">' + perf_pills + '</div>'
         + '</div></div>'
 
-        + '<div class="section"><div class="sec-hdr"><span class="sec-num">02</span><h2>Load</h2></div>'
+        + '<div class="section"><div class="sec-hdr"><h2>Load</h2></div>'
         + '<div class="sec-body">'
         + '<div class="big"><div class="bignum" style="color:' + lc + '">' + pct(cl) + '</div>'
         + '<div class="meta"><strong>Mean load score</strong>0% = all nodes low load (healthy)<br>100% = all nodes high load (stressed)</div></div>'
@@ -769,40 +897,152 @@ def render_country(country, hist, generated):
         + '</div></div>'
         + '</div>'
 
-        # node table
-        + '<div class="section"><div class="sec-hdr"><span class="sec-num">03</span><h2>Nodes in ' + cc + '</h2></div>'
+        + '<div class="section"><div class="sec-hdr"><h2>Nodes in ' + cc + '</h2></div>'
         + '<div class="sec-body" style="padding:0"><div class="tbl-wrap"><table>'
         + '<thead><tr><th>Identity Key</th><th>Name</th><th>City</th><th>Performance</th><th>Perf Tier</th><th>Load</th><th>Uptime 24h</th><th>Links</th></tr></thead>'
         + '<tbody>' + node_rows + '</tbody>'
         + '</table></div></div></div>'
 
         + '</main>'
-        + '<footer class="footer">' + API_URL + ' &nbsp;&#183;&nbsp; ' + flag(cc) + ' ' + cc + ' &nbsp;&#183;&nbsp; <a href="../index.html">&#8592; All locations</a></footer>'
+        + '<footer class="footer">' + GATEWAYS_API + ' &nbsp;&#183;&nbsp; ' + flag(cc) + ' ' + cc + ' &nbsp;&#183;&nbsp; <a href="../index.html">&#8592; All locations</a></footer>'
         + page_close()
     )
 
+
+
+
+# ── Residential inline section (for index page) ───────────────────────────────
+def render_residential_inline(nodes):
+    """Compact residential board for the right column of the index page."""
+    if not nodes:
+        body = '<tr><td colspan="5" class="no-alerts">No residential IP gateways right now</td></tr>'
+    else:
+        body = ""
+        for n in nodes:
+            ikey = n["identity_key"]
+            cc   = n.get("cc", "??")
+            hm   = HARBOURMASTER.format(k=ikey)
+            sd   = SPECTREDAO.format(k=ikey)
+            ps   = pct(n["perf_score"]) if n["has_probe"] else "no probe"
+            body += (
+                '<tr>'
+                '<td><span title="' + ikey + ' &#183; ' + (n.get("asn_name") or "") + '">' + n["name"] + '</span>'
+                '<br><span class="ikey">' + (n.get("city") or "&#8212;") + '</span></td>'
+                '<td><a href="country/' + cc + '.html">' + flag(cc) + ' ' + cc + '</a></td>'
+                '<td>' + ps + ' ' + perf_badge(n["perf_tier"]) + '</td>'
+                '<td>' + load_badge(n["load_str"] or "unknown") + '</td>'
+                '<td style="white-space:nowrap">'
+                '<a class="nlink" title="Harbourmaster" href="' + hm + '" target="_blank" rel="noopener">HM</a> '
+                '<a class="nlink" title="SpectreDAO explorer" href="' + sd + '" target="_blank" rel="noopener">SD</a>'
+                '</td>'
+                '</tr>'
+            )
+    return (
+        '<div class="section">'
+        '<div class="sec-hdr"><h2>Residential IP Gateways</h2>'
+        '<span style="margin-left:auto;font-size:11px;font-family:var(--mono)">'
+        '<a href="residential.html">full view &#8594;</a></span></div>'
+        '<div class="sec-body" style="padding:0"><div class="tbl-wrap"><table>'
+        '<thead><tr><th>Name</th><th>Country</th><th>Performance</th><th>Load</th><th>Links</th></tr></thead>'
+        '<tbody>' + body + '</tbody>'
+        '</table></div></div></div>'
+    )
+
+
+# ── Residential page ──────────────────────────────────────────────────────────
+def render_residential(nodes, generated):
+    node_rows = ""
+    for n in nodes:
+        ikey  = n["identity_key"]
+        ishrt = (ikey[:20] + "&#8230;") if len(ikey) > 20 else ikey
+        hm    = HARBOURMASTER.format(k=ikey)
+        sd    = SPECTREDAO.format(k=ikey)
+        upt   = (str(round(n["uptime"] * 100)) + "%") if n.get("uptime") is not None else "&#8212;"
+        ps    = pct(n["perf_score"]) if n["has_probe"] else "no probe"
+        node_rows += (
+            "<tr>"
+            "<td><span class=\"ikey\" title=\"" + ikey + "\">" + ishrt + "</span></td>"
+            "<td>" + n["name"] + "</td>"
+            "<td>" + flag(n["cc"]) + " " + n["cc"] + "</td>"
+            "<td>" + (n.get("city") or "&#8212;") + "</td>"
+            "<td>" + (n.get("asn_name") or "&#8212;") + "</td>"
+            "<td>" + ps + "</td>"
+            "<td>" + perf_badge(n["perf_tier"]) + "</td>"
+            "<td>" + load_badge(n["load_str"] or "unknown") + "</td>"
+            "<td>" + upt + "</td>"
+            "<td style=\"display:flex;gap:8px;flex-wrap:wrap\">"
+            "<a class=\"nlink\" href=\"" + hm + "\" target=\"_blank\" rel=\"noopener\">Harbourmaster</a>"
+            "<a class=\"nlink\" href=\"" + sd + "\" target=\"_blank\" rel=\"noopener\">SpectrDAO</a>"
+            "</td>"
+            "</tr>"
+        )
+
+    return (
+        page_open("Nym &#8212; Residential IPs")
+        + render_header("Residential IPs &#8212; Gateway Nodes", generated, back="index.html")
+        + render_summary([
+            (str(len(nodes)), "Residential Nodes"),
+            (str(len(set(n["cc"] for n in nodes))), "Countries"),
+        ])
+        + "<main class=\"main\">"
+        + "<div class=\"section\">"
+        + "<div class=\"sec-hdr\"><h2>Residential IP Nodes</h2></div>"
+        + "<div class=\"sec-body\" style=\"padding:0\"><div class=\"tbl-wrap\"><table>"
+        + "<thead><tr>"
+        + "<th>Identity Key</th><th>Name</th><th>Country</th><th>City</th>"
+        + "<th>ASN</th><th>Performance</th><th>Perf Tier</th><th>Load</th>"
+        + "<th>Uptime 24h</th><th>Links</th>"
+        + "</tr></thead>"
+        + "<tbody>" + node_rows + "</tbody>"
+        + "</table></div></div></div>"
+        + "</main>"
+        + "<footer class=\"footer\">"
+        + "Residential nodes identified via location.asn.kind field &nbsp;&#183;&nbsp; "
+        + "<a href=\"index.html\">&#8592; Network Metrics</a>"
+        + "</footer>"
+        + page_close()
+    )
 
 # ── Main ──────────────────────────────────────────────────────────────────────
 def main():
     now       = datetime.datetime.now(datetime.timezone.utc)
     generated = now.strftime("%Y-%m-%d %H:%M UTC")
-    print("[" + now.isoformat() + "] Fetching " + API_URL + " ...")
+    print("[" + now.isoformat() + "] Starting ...")
 
     try:
         gateways = fetch_gateways()
+        print("  Gateways: " + str(len(gateways)))
     except Exception as e:
-        print("ERROR: fetch failed: " + str(e), file=sys.stderr)
+        print("ERROR: gateways fetch failed: " + str(e), file=sys.stderr)
         sys.exit(1)
 
-    print("  Got " + str(len(gateways)) + " gateway entries")
+    try:
+        total_nodes = fetch_total_nodes()
+        print("  Total nodes (all types): " + str(total_nodes))
+    except Exception as e:
+        print("  WARN: total nodes fetch failed: " + str(e))
+        total_nodes = None
+
+    try:
+        fam = fetch_family_stats()
+        print("  Active families: " + str(fam["active_families"]) +
+              "  Nodes in families: " + str(fam["nodes_in_families"]) +
+              "  (GW: " + str(fam["gw_in_families"]) +
+              "  MX: " + str(fam["mix_in_families"]) + ")")
+    except Exception as e:
+        print("  WARN: families fetch failed: " + str(e))
+        fam = {"active_families": None, "nodes_in_families": None,
+               "gw_in_families": None, "mix_in_families": None}
+
     data = aggregate(gateways)
-    print("  Nodes: " + str(data["total"]) + "  Locations: " + str(data["location_count"]) +
-          "  Perf: " + pct(data["mean_perf"]) + "  Load: " + pct(data["mean_load"]))
+    print("  Locations: " + str(data["location_count"]) +
+          "  Perf: " + pct(data["mean_perf"]) +
+          "  Load: " + pct(data["mean_load"]))
 
     hist = load_global_history()
     print("  History: " + str(len(hist["labels"]) if hist else 0) + " snapshots")
 
-    atomic_write(OUTPUT_INDEX, render_index(data, hist, generated))
+    atomic_write(OUTPUT_INDEX, render_index(data, fam, total_nodes, hist, generated))
     print("  Written -> " + str(OUTPUT_INDEX))
 
     OUTPUT_COUNTRY.mkdir(parents=True, exist_ok=True)
@@ -811,6 +1051,18 @@ def main():
         atomic_write(OUTPUT_COUNTRY / (c["cc"] + ".html"), render_country(c, cc_hist, generated))
 
     print("  Written -> " + str(len(data["countries"])) + " country pages")
+
+    atomic_write(OUTPUT_RESIDENTIAL, render_residential(data["residential_nodes"], generated))
+    print("  Written -> " + str(OUTPUT_RESIDENTIAL))
+
+    # interim static API (/api/v0/ + /swagger/); a failure here must never break the dashboard
+    try:
+        import interim_api
+        n = interim_api.write_all(OUTPUT_INDEX.parent, DB_PATH, data, fam, total_nodes,
+                                  now.strftime("%Y-%m-%dT%H:%M:%SZ"), atomic_write)
+        print("  Written -> " + str(n) + " interim API files (/api/v0/, /swagger/)")
+    except Exception as e:
+        print("  WARN: interim API write failed: " + str(e), file=sys.stderr)
 
 
 if __name__ == "__main__":
