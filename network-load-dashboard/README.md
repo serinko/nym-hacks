@@ -74,7 +74,7 @@ sudo mkdir -p /opt/nym-metrics /var/lib/nym-metrics /var/www/html/network-load
 sudo cp nym-hacks/network-load-dashboard/{generate_network_metrics.py,interim_api.py,record_snapshot.py} /opt/nym-metrics/
 ```
 
-> Do not paste the scripts through `nvim`/`vim` - auto-indent and auto-pairing silently break Python. Use `git clone`, `scp` or `cat > file << 'EOF'`.
+> Do not paste the scripts through `nvim`/`vim` - auto-indent and auto-pairing silently break Python. Use `git clone`, `scp` or `cat > file << 'EOF'`. Eventually use `nano`.
 
 ### 3. Add nginx vhost
 
