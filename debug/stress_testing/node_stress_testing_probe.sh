@@ -1,78 +1,121 @@
 #!/usr/bin/env bash
 #
-# node-cpu-probe.sh - is this box's CPU actually yours?
+# node_stress_testing_probe.sh
 #
-# Measures the things that predict a mixnode's stress_testing_score:
-#   steal time   - how much CPU the hypervisor takes away from you
-#   crypto rate  - Sphinx packet processing is AES/SHA bound
-#   jitter       - scheduling latency under contention
+# Why is this node's stress_testing_score low?
 #
-# Read-only, changes nothing. Run on the candidate box AND on a node you
-# know scores well, then compare.
+# The stress test sends its packets over ONE connection, and nym-node handles
+# one connection on ONE core. Single-core speed is the binding constraint -
+# core count and RAM are not. This probe measures the things that actually
+# predict the score:
 #
-#   ./node-cpu-probe.sh            # 60s sample
-#   ./node-cpu-probe.sh 300        # 5min sample, better for spotting bursts
+#   clock speed      - strongest single predictor across the fleet
+#   AES-NI effective - advertised is not the same as working
+#   steal time       - how much CPU the hypervisor takes from you
+#   jitter           - whether your vCPU gets descheduled under load
+#   buffer setting   - the one in-config workaround
+#
+# Read-only. Changes nothing.
+#
+#   ./node_stress_testing_probe.sh           # 60s sample
+#   ./node_stress_testing_probe.sh 300       # 5min, catches bursty contention
+#
+# Run it on a node that scores WELL too, and compare.
 
 set -uo pipefail
 SECS="${1:-60}"
+VERDICT=()
 
 hr(){ printf '\n=============== %s ===============\n' "$1"; }
+flag(){ VERDICT+=("$1"); echo "  >> $1"; }
 
+# ---------------------------------------------------------------- identity --
 hr "IDENTITY"
-echo "  host    : $(hostname)"
-echo "  model   : $(lscpu | awk -F': *' '/Model name/{print $2; exit}')"
-echo "  MHz     : $(lscpu | awk -F': *' '/CPU MHz|CPU max MHz/{print $2; exit}')"
-echo "  cores   : $(nproc)"
-echo "  RAM     : $(free -g | awk '/Mem:/{print $2" GB"}')"
-echo "  virt    : $(systemd-detect-virt 2>/dev/null || echo '?')"
-echo "  flags   : aes=$(grep -qm1 ' aes ' /proc/cpuinfo && echo yes || echo NO) \
-avx2=$(grep -qm1 ' avx2 ' /proc/cpuinfo && echo yes || echo NO)"
-
-# A generic model name means the hypervisor masks the real CPU - the signature
-# of a shared, oversubscribed tier.
 MODEL=$(lscpu | awk -F': *' '/Model name/{print $2; exit}')
-case "$MODEL" in
-  *QEMU*|*"Common KVM"*)  echo "  >> EMULATED CPU model - strongest predictor of a poor stress score" ;;
-  *[0-9][0-9][0-9][0-9]*|*Ryzen*|*EPYC\ [0-9]*) echo "  >> real SKU exposed - good sign" ;;
-  *) echo "  >> generic family placeholder - shared tier likely" ;;
+MHZ=$(lscpu | awk -F': *' '/CPU max MHz/{printf "%.0f",$2; exit}')
+[ -z "${MHZ:-}" ] && MHZ=$(lscpu | awk -F': *' '/CPU MHz/{printf "%.0f",$2; exit}')
+[ -z "${MHZ:-}" ] && MHZ=$(awk -F': ' '/cpu MHz/{printf "%.0f",$2; exit}' /proc/cpuinfo)
+echo "  host    : $(hostname)"
+echo "  model   : ${MODEL:-unknown}"
+echo "  clock   : ${MHZ:-unknown} MHz"
+echo "  cores   : $(nproc)   (not a factor - one connection uses one core)"
+echo "  RAM     : $(free -g | awk '/Mem:/{print $2}') GB   (not a factor)"
+echo "  virt    : $(systemd-detect-virt 2>/dev/null || echo '?')"
+
+# Fleet data: 80% of nodes at 2.0-2.2 GHz fail, 9% above 2.8 GHz fail.
+# Nominal clock is a decent predictor but not conclusive: some fast cores
+# report a low nominal MHz under virtualisation. The verdict is reconciled
+# against the measured results in the SUMMARY.
+if [ -n "${MHZ:-}" ] && [ "$MHZ" -gt 0 ] 2>/dev/null; then
+  if   [ "$MHZ" -ge 2800 ]; then echo "  >> clock is comfortable (>=2.8 GHz band: 9% fail)"
+  elif [ "$MHZ" -ge 2500 ]; then echo "  >> clock is adequate (2.5-2.8 band: 21% fail)"
+  elif [ "$MHZ" -ge 2200 ]; then echo "  >> clock looks marginal (2.2-2.5 band: 41% fail) - see summary"
+  else                           echo "  >> clock looks low (<2.2 band: 80% fail) - see summary"
+  fi
+fi
+
+case "${MODEL:-}" in
+  *QEMU*|*"Common KVM"*)
+      flag "EMULATED CPU model - fleet median stress score 0.137" ;;
+  *[0-9][0-9][0-9][0-9]*|*Ryzen*|*EPYC\ [0-9]*)
+      echo "  >> real CPU model exposed - fleet median 0.991" ;;
+  *)  flag "generic CPU model - hypervisor masking a shared tier, fleet median 0.853" ;;
 esac
 
-hr "STEAL TIME  (${SECS}s)   <-- the direct oversubscription measure"
-read -r _ u1 n1 s1 i1 w1 irq1 sirq1 st1 _ < /proc/stat
-sleep "$SECS"
-read -r _ u2 n2 s2 i2 w2 irq2 sirq2 st2 _ < /proc/stat
-tot=$(( (u2+n2+s2+i2+w2+irq2+sirq2+st2) - (u1+n1+s1+i1+w1+irq1+sirq1+st1) ))
-stl=$(( st2 - st1 )); iow=$(( w2 - w1 )); idl=$(( i2 - i1 ))
-awk -v s="$stl" -v t="$tot" -v w="$iow" -v i="$idl" 'BEGIN{
-  printf "  steal   : %.2f%%\n", 100*s/t
-  printf "  iowait  : %.2f%%\n", 100*w/t
-  printf "  idle    : %.2f%%\n", 100*i/t
-  st=100*s/t
-  if (st < 0.5)      print "  >> negligible contention - CPU is effectively yours"
-  else if (st < 2)   print "  >> mild contention - acceptable"
-  else if (st < 5)   print "  >> NOTICEABLE contention - likely to cost stress score"
-  else               print "  >> HEAVY contention - expect a poor stress score"
-}'
-
-hr "CRYPTO THROUGHPUT  (Sphinx is AES/SHA bound)"
-if command -v openssl >/dev/null; then
-  for alg in aes-256-gcm sha256; do
-    out=$(openssl speed -elapsed -evp "$alg" 2>/dev/null | tail -1)
-    printf "  %-12s %s\n" "$alg" "$(echo "$out" | sed 's/^[^ ]* *//')"
-  done
-  echo "  (compare the 8192-byte column against a known-good node)"
+# ------------------------------------------------------------------- AES-NI --
+hr "AES-NI  (advertised vs actually working)"
+if command -v openssl >/dev/null 2>&1; then
+  ON=$(openssl speed -elapsed -evp aes-256-gcm 2>/dev/null | tail -1 | awk '{print $(NF-1)}' | tr -d 'k')
+  OFF=$(OPENSSL_ia32cap="~0x200000200000000" openssl speed -elapsed -evp aes-256-gcm 2>/dev/null | tail -1 | awk '{print $(NF-1)}' | tr -d 'k')
+  printf "  AES-256-GCM @8KB, normal        : %'.0f k\n" "${ON:-0}" 2>/dev/null || echo "  normal : ${ON:-?}k"
+  printf "  AES-256-GCM @8KB, AES-NI forced off : %'.0f k\n" "${OFF:-0}" 2>/dev/null || echo "  forced off : ${OFF:-?}k"
+  if [ -n "${ON:-}" ] && [ -n "${OFF:-}" ] && [ "${OFF%.*}" -gt 0 ] 2>/dev/null; then
+    RATIO=$(awk -v a="$ON" -v b="$OFF" 'BEGIN{printf "%.1f", a/b}')
+    echo "  ratio   : ${RATIO}x"
+    awk -v r="$RATIO" 'BEGIN{exit !(r < 2)}' \
+      && flag "AES-NI ADVERTISED BUT NOT EFFECTIVE - ask your provider for host-passthrough" \
+      || echo "  >> AES-NI is working"
+  fi
 else
   echo "  openssl not installed - apt-get install -y openssl"
 fi
 
-hr "SINGLE-CORE COMPUTE"
+# --------------------------------------------------------------- contention --
+hr "CPU CONTENTION  (${SECS}s sample)"
+read -r _ u1 n1 s1 i1 w1 q1 sq1 st1 _ < /proc/stat
+sleep "$SECS"
+read -r _ u2 n2 s2 i2 w2 q2 sq2 st2 _ < /proc/stat
+tot=$(( (u2+n2+s2+i2+w2+q2+sq2+st2) - (u1+n1+s1+i1+w1+q1+sq1+st1) ))
+awk -v s="$((st2-st1))" -v t="$tot" -v w="$((w2-w1))" 'BEGIN{
+  printf "  steal   : %.2f%%\n", 100*s/t
+  printf "  iowait  : %.2f%%\n", 100*w/t
+}'
+STEAL=$(awk -v s="$((st2-st1))" -v t="$tot" 'BEGIN{printf "%.2f",100*s/t}')
+awk -v s="$STEAL" 'BEGIN{exit !(s >= 2)}' \
+  && flag "noticeable CPU steal (${STEAL}%) - the host is oversubscribed" \
+  || echo "  >> contention is low"
+
+# ------------------------------------------------------------ single core --
+hr "SINGLE-CORE SPEED  (what the stress test actually exercises)"
 s=$(date +%s%N)
-awk 'BEGIN{x=0; for(i=0;i<4000000;i++) x+=sqrt(i); print ""}' >/dev/null
+awk 'BEGIN{x=0; for(i=0;i<4000000;i++) x+=sqrt(i)}' >/dev/null
 e=$(date +%s%N)
-echo "  4M sqrt loop : $(( (e-s)/1000000 )) ms   (lower is better; <1500ms is healthy)"
+MS=$(( (e-s)/1000000 ))
+echo "  4M sqrt loop : ${MS} ms"
+[ "$MS" -gt 1500 ] && flag "single-core compute is slow (${MS} ms)" || echo "  >> single-core speed is fine"
+
+# Reconcile the nominal clock against what the core actually did.
+if [ -n "${MHZ:-}" ] && [ "$MHZ" -lt 2500 ] 2>/dev/null; then
+  if [ "$MS" -le 400 ] && awk -v r="${RATIO:-0}" 'BEGIN{exit !(r >= 5)}'; then
+    echo "  >> nominal clock reads ${MHZ} MHz but this core is fast in practice -"
+    echo "     treat the low clock reading as misleading, not as a problem"
+  else
+    flag "slow core (nominal ${MHZ} MHz, confirmed by measurement) - a buffer will not rescue this"
+  fi
+fi
 
 hr "SCHEDULING JITTER"
-if command -v python3 >/dev/null; then
+if command -v python3 >/dev/null 2>&1; then
 python3 - <<'PY'
 import time
 d=[]
@@ -80,29 +123,52 @@ for _ in range(200):
     t=time.perf_counter(); time.sleep(0.005)
     d.append((time.perf_counter()-t-0.005)*1000)
 d.sort()
-print(f"  median {d[len(d)//2]:.2f} ms   p95 {d[int(len(d)*.95)]:.2f} ms   max {d[-1]:.2f} ms")
-print("  >> p95 above ~5ms suggests the vCPU is being descheduled under load")
+p95=d[int(len(d)*.95)]
+print(f"  median {d[len(d)//2]:.2f} ms   p95 {p95:.2f} ms   max {d[-1]:.2f} ms")
+print("  >> vCPU is being descheduled under load" if p95>5 else "  >> scheduling is clean")
 PY
 else
   echo "  python3 not available"
 fi
 
-hr "NODE STRESS SCORE  (once bonded and tested)"
-ID=$(cat /root/.nym/nym-nodes/*/data/ed25519_identity.pub 2>/dev/null | tr -d '"[:space:]' | head -1)
-if [ -n "${ID:-}" ]; then
-  NID=$(curl -s --max-time 20 "https://api.nym.spectredao.net/api/v1/nodes?limit=2000" \
-        | python3 -c "
-import json,sys
-k='$ID'
-for n in json.load(sys.stdin):
-    if n.get('identity_key')==k:
-        print(n['node_id'],n.get('stress_testing_score'),n.get('performance_score'));break
-else: print('not-bonded-yet')
-" 2>/dev/null)
-  echo "  identity : $ID"
-  echo "  node_id / stress / performance : $NID"
-  echo "  track with: curl -s https://validator.nymtech.net/api/v2/nym-nodes/annotation/<node_id> | jq .annotation.detailed_performance"
+# ----------------------------------------------------------- node config --
+hr "NODE CONFIG"
+CFG=$(ls -d /root/.nym/nym-nodes/*/config/config.toml 2>/dev/null | head -1)
+if [ -n "$CFG" ]; then
+  echo "  config  : $CFG"
+  BUF=$(grep -oP '^\s*maximum_connection_buffer_size\s*=\s*\K[0-9]+' "$CFG" 2>/dev/null | head -1)
+  if [ -n "$BUF" ]; then
+    echo "  maximum_connection_buffer_size = $BUF  (default 192)"
+    [ "$BUF" -le 192 ] && flag "egress buffer still at default - try 1000 under [mixnet.debug]"
+  else
+    flag "egress buffer not set (default 192) - try 1000 under [mixnet.debug]"
+  fi
 else
-  echo "  no node identity found yet"
+  echo "  no nym-node config found"
 fi
+
+# ---------------------------------------------------------------- score --
+hr "CURRENT SCORE"
+KEY=$(cat /root/.nym/nym-nodes/*/data/ed25519_identity.pub 2>/dev/null \
+      | tr -d '"[:space:]' | grep -v 'BEGIN\|END' | head -1)
+if [ -n "${KEY:-}" ] && command -v curl >/dev/null 2>&1; then
+  echo "  identity : $KEY"
+  echo "  look up your node_id, then:"
+else
+  echo "  identity key not found"
+fi
+echo "    curl -s https://validator.nymtech.net/api/v2/nym-nodes/annotation/<NODE_ID> | jq .annotation.detailed_performance"
+echo "  (v1 does NOT show stress_testing_score - use v2)"
+
+# --------------------------------------------------------------- summary --
+hr "SUMMARY"
+if [ ${#VERDICT[@]} -eq 0 ]; then
+  echo "  Nothing flagged. If the score is still low, check was_reachable -"
+  echo "  a false there is a firewall problem, not CPU."
+else
+  printf '  - %s\n' "${VERDICT[@]}"
+fi
+echo
+echo "  Guide : https://github.com/serinko/nym-hacks/blob/master/debug/stress_testing/fixing-low-stress-score.md"
+echo "  Report: https://github.com/serinko/nym-hacks/blob/master/debug/stress_testing/mixnode_stress_report.md"
 echo
