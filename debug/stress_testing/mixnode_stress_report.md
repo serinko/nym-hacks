@@ -10,12 +10,11 @@ Operator-facing fix guide: [fixing-low-stress-score.md](./fixing-low-stress-scor
 
 The stress test drives its load down a **single connection**, and `nym-node` processes one connection on **one core**. Single-core throughput is therefore the binding constraint, and clock speed predicts the score while core count and RAM do not.
 
-Two things make a core too slow:
+The dominant cost is **one X25519 scalar multiplication per packet** to derive its shared secret - around 60-65% of CPU during a stress run, measured by an operator profiling a live test. The AES over the payload is 3-4%.
 
-1. **Low clock.** 80% of nodes between 2.0 and 2.2 GHz fail; 9% above 2.8 GHz do.
-2. **AES-NI advertised but not delivered.** Virtualised CPUs that mask the host model can run AES at software speed - measured 40x slower on one node - which cripples an otherwise adequate CPU.
+What makes a core too slow is therefore its raw single-thread speed: 80% of nodes between 2.0 and 2.2 GHz fail, against 9% above 2.8 GHz. Virtualised CPUs that mask the host model are slow at this and everything else, which is why an emulated CPU model is such a strong negative signal.
 
-Neither is fixable by buying more cores or more RAM.
+None of it is fixable by buying more cores or more RAM.
 
 Nym is reducing the size of the stress bursts, which will lift borderline nodes without operator action. The deeper question - why one connection cannot use more than one core - is a development matter covered in §6.
 
@@ -81,19 +80,28 @@ The sub-2.0 band is small and mixed - a few genuinely fast cores report low nomi
 
 A generic name means the hypervisor masks the real CPU for live-migration compatibility - the signature of an oversubscribed shared tier. A real SKU means dedicated or passthrough.
 
-### The AES-NI mechanism
+### The actual cost: X25519, not AES
 
-Measured on one `QEMU Virtual CPU version 2.5+` node, AES-256-GCM at 8 KB blocks:
+Sphinx derives a shared secret per packet with one X25519 scalar multiplication. On the same reference CPU:
 
-| | throughput |
-|---|---|
-| reference CPU, AES-NI enabled | 11,779,003k |
-| reference CPU, AES-NI forced off | 193,391k |
-| the QEMU node | **290,264k** |
+| operation | rate | per packet |
+|---|---|---|
+| X25519 ECDH | 26,515 ops/sec | **37.7 µs** |
+| AES-256-GCM over a ~2 KB payload | 2,990,555k B/s | 0.68 µs |
 
-`/proc/cpuinfo` advertised `aes`, but throughput sat beside the *software* figure - roughly 40x below hardware. SHA-256 was 5.5x slower, consistent with raw core speed rather than a missing instruction.
+X25519 costs roughly **55x** more than the packet's AES. An operator profiling a live stress run measured 62-67% of CPU in Curve25519 against 3-4% in AES, which matches.
 
-That node was predicted to fail from hardware alone, before bonding. It subsequently scored **0.256** - an out-of-sample confirmation.
+This also explains the burst sizes directly. At ~26,500 ops/sec a 45,000-packet burst is about **1.7 seconds** of solid single-core crypto; on a core a third as fast, 5 seconds - long enough for the egress queue to fill and drop.
+
+Benchmark it with:
+
+```sh
+openssl speed -elapsed ecdhx25519 | tail -2
+```
+
+**Correction.** An earlier version of this report identified AES-NI as the mechanism, after measuring 290,264k on a `QEMU Virtual CPU version 2.5+` node against 11,779,003k on reference hardware - software-AES speed despite `/proc/cpuinfo` advertising `aes`. That node was predicted to fail from hardware alone and subsequently scored **0.256**, which appeared to confirm it.
+
+The prediction held but the explanation was wrong. An emulated CPU is slow at *everything*, including X25519; AES was simply the easier thing to measure, and it correlated. The clock-speed findings stand, because clock is a proxy for single-thread speed generally. The AES-NI causal story does not.
 
 ### Provider, as a consequence
 
@@ -118,7 +126,7 @@ Provider matters only as a proxy for which CPU tier you land on - see the correc
 |---|---|
 | **Core count** | Non-monotonic. 2 cores median 0.995; 4 cores 0.875. Follows directly from one-connection-one-core. |
 | **RAM** | Non-monotonic. 2 GB median 0.995; 4 GB 0.742. |
-| **AES-NI presence** | Universal (144/144 report the flag). Presence is meaningless; *effectiveness* is what matters. |
+| **AES-NI** | Universal (144/144 report the flag), and AES is only 3-4% of the work. Not the bottleneck. |
 | **AVX2** | Only 3 nodes lack it; they score 0.943. |
 | **CPU age** | `Xeon E5-2690 v4` (2016) scores 0.999. Old dedicated silicon beats new shared vCPU. |
 | **Intel vs AMD** | Appears strong (0.765 vs 0.987) but dissolves - Intel is over-represented in the shared tier. |
@@ -173,14 +181,15 @@ The node therefore scales **across** connections, not **within** one - and the s
 let (sender, receiver) = mpsc::channel(self.config.maximum_connection_buffer_size);
 ```
 
-One bounded queue per outbound connection; default **192** (`nym-node/src/config/mod.rs:934`). When full, packets drop. Raising it to 1000 buys time to absorb a burst but does not raise throughput - and costs latency under load.
+One bounded queue per outbound connection; default **192** (`nym-node/src/config/mod.rs:934`). When full, packets drop.
+
+Raising it was circulated as a workaround and does lift the score, but the field's own doc comment rules it out: *"a short-term burst absorber, not a queue... an oversized value is just bufferbloat... further packets are dropped rather than delayed, which is preferable in a mixnet where a packet held that long has already missed its usefulness window."* It improves the metric while making the node marginally worse at its actual job. **Not recommended.**
 
 ### Development options
 
-- **Offload the unwrap** to `spawn_blocking` or a rayon pool, so one connection can use several cores. Complicated by packet ordering and the replay-detection batching in the same file.
-- **Pipeline within the connection** - decouple the read loop from a small pool of decrypt workers.
-- **Use multiple connections in the stress test**, measuring aggregate capacity rather than single-core speed. More representative, but it would stop surfacing slow-core nodes, which is useful signal.
-- **Reduce burst size** - already in progress, and will lift borderline nodes without operator action.
+- **Reduce burst size** - already in progress. Burst has moved 30k → 90k → 45k; at ~26,500 X25519/s, 45k is roughly 1.7s of single-core work on a healthy node.
+- **Use multiple connections in the stress test**, measuring aggregate capacity rather than single-core speed. More representative of real traffic, but it would stop surfacing slow-core nodes, which is useful signal.
+- **Parallelising the unwrap** across cores is *not* planned. Note this does not mean a node only ever uses one core: each connection gets its own task and those are spread across all cores, so with real traffic from many peers the whole CPU is in use. It is a single connection that cannot be split.
 
 ---
 
@@ -190,8 +199,10 @@ One bounded queue per outbound connection; default **192** (`nym-node/src/config
 
 ```sh
 lscpu | grep "Model name"
-openssl speed -elapsed -evp aes-256-gcm | tail -1
+openssl speed -elapsed ecdhx25519 | tail -2
 ```
+
+A real CPU model at 2.8 GHz or above, reaching 25,000+ X25519 ops/sec.
 
 **Delegations Program.** Current hardware criteria specify cores and RAM - the two attributes shown here not to matter. Replace with clock speed and CPU model exposure, both machine-readable from `:8080/api/v1/system-info`.
 
@@ -215,4 +226,4 @@ Several cells are n=2-7. The direction is consistent across independent provider
 
 Scores are current aggregates, not time series. Per-run history from the orchestrator (`/v1/results/nym-node/{id}/testruns`, bearer token) would show how long each node has been failing and the error text on the unreachable ones.
 
-Credit: the single-connection/single-core mechanism and the `maximum_connection_buffer_size` workaround came from operator and engineering investigation, and are the better explanation of what this data shows.
+Credit: the single-connection/single-core mechanism came from engineering investigation, and the Curve25519-vs-AES profile from an operator running `perf` against a live stress test. Both corrected earlier conclusions in this report. The `maximum_connection_buffer_size` workaround was also suggested by operators but is **not** recommended - see §2 of the operator guide.
