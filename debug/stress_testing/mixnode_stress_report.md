@@ -96,9 +96,9 @@ The burst is not delivered all at once, so per-op cost does not translate direct
 | node | X25519 (OpenSSL) | stress | notes |
 |---|---|---|---|
 | operator's healthy node | 21,300 op/s | 1.000 | 45k run, busiest thread 23%, zero drops |
-| `QEMU Virtual CPU`, 2197 MHz | 10,262 op/s | 0.244 | 5.37% steal while idle (1.29% two days earlier) |
+| `QEMU Virtual CPU`, 2197 MHz | 10,262-15,263 op/s across runs | 0.244 | idle steal 0.11-5.37% across runs |
 
-On throughput alone the second node should run around half-busy and cope. It doesn't, which points at contention - the hypervisor taking the core away mid-burst - rather than raw speed.
+On throughput alone the second node should cope comfortably - at its best run it is only 1.4x slower than the node scoring 1.0. Its benchmarks swung 49% between runs while its score stayed at 0.244. That points at contention - the hypervisor taking the core away mid-burst - rather than raw speed. It also means a single idle benchmark on a shared host says little on its own.
 
 Benchmark with the command below, but only as a relative check against a known-good node on similar hardware. OpenSSL is not the code path `nym-node` runs, and the ratio between the two implementations varies by CPU:
 
