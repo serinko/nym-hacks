@@ -10,10 +10,9 @@
 # predict the score:
 #
 #   clock speed      - strongest single predictor across the fleet
-#   AES-NI effective - advertised is not the same as working
 #   steal time       - how much CPU the hypervisor takes from you
 #   jitter           - whether your vCPU gets descheduled under load
-#   buffer setting   - the one in-config workaround
+#   buffer setting   - should be at the default (192)
 #
 # Read-only. Changes nothing.
 #
@@ -62,24 +61,6 @@ case "${MODEL:-}" in
   *)  flag "generic CPU model - hypervisor masking a shared tier, fleet median 0.853" ;;
 esac
 
-# ------------------------------------------------------------------- AES-NI --
-hr "AES-NI  (advertised vs actually working)"
-if command -v openssl >/dev/null 2>&1; then
-  ON=$(openssl speed -elapsed -evp aes-256-gcm 2>/dev/null | tail -1 | awk '{print $(NF-1)}' | tr -d 'k')
-  OFF=$(OPENSSL_ia32cap="~0x200000200000000" openssl speed -elapsed -evp aes-256-gcm 2>/dev/null | tail -1 | awk '{print $(NF-1)}' | tr -d 'k')
-  printf "  AES-256-GCM @8KB, normal        : %'.0f k\n" "${ON:-0}" 2>/dev/null || echo "  normal : ${ON:-?}k"
-  printf "  AES-256-GCM @8KB, AES-NI forced off : %'.0f k\n" "${OFF:-0}" 2>/dev/null || echo "  forced off : ${OFF:-?}k"
-  if [ -n "${ON:-}" ] && [ -n "${OFF:-}" ] && [ "${OFF%.*}" -gt 0 ] 2>/dev/null; then
-    RATIO=$(awk -v a="$ON" -v b="$OFF" 'BEGIN{printf "%.1f", a/b}')
-    echo "  ratio   : ${RATIO}x"
-    awk -v r="$RATIO" 'BEGIN{exit !(r < 2)}' \
-      && flag "AES-NI ADVERTISED BUT NOT EFFECTIVE - ask your provider for host-passthrough" \
-      || echo "  >> AES-NI is working"
-  fi
-else
-  echo "  openssl not installed - apt-get install -y openssl"
-fi
-
 # --------------------------------------------------------------- contention --
 hr "CPU CONTENTION  (${SECS}s sample)"
 read -r _ u1 n1 s1 i1 w1 q1 sq1 st1 _ < /proc/stat
@@ -106,7 +87,7 @@ echo "  4M sqrt loop : ${MS} ms"
 
 # Reconcile the nominal clock against what the core actually did.
 if [ -n "${MHZ:-}" ] && [ "$MHZ" -lt 2500 ] 2>/dev/null; then
-  if [ "$MS" -le 400 ] && awk -v r="${RATIO:-0}" 'BEGIN{exit !(r >= 5)}'; then
+  if [ "$MS" -le 400 ]; then
     echo "  >> nominal clock reads ${MHZ} MHz but this core is fast in practice -"
     echo "     treat the low clock reading as misleading, not as a problem"
   else
@@ -137,11 +118,11 @@ CFG=$(ls -d /root/.nym/nym-nodes/*/config/config.toml 2>/dev/null | head -1)
 if [ -n "$CFG" ]; then
   echo "  config  : $CFG"
   BUF=$(grep -oP '^\s*maximum_connection_buffer_size\s*=\s*\K[0-9]+' "$CFG" 2>/dev/null | head -1)
-  if [ -n "$BUF" ]; then
+  if [ -n "$BUF" ] && [ "$BUF" -ne 192 ]; then
     echo "  maximum_connection_buffer_size = $BUF  (default 192)"
-    [ "$BUF" -le 192 ] && flag "egress buffer still at default - try 1000 under [mixnet.debug]"
+    flag "egress buffer changed to $BUF - comment it out and restart nym-node"
   else
-    flag "egress buffer not set (default 192) - try 1000 under [mixnet.debug]"
+    echo "  >> egress buffer at the default (192)"
   fi
 else
   echo "  no nym-node config found"
